@@ -56,8 +56,8 @@ onto `go-googlesql`.
 go get github.com/goccy/go-googlesql
 ```
 
-The first build is heavy: the embedded `googlesql.wasm` is ~12 MB and
-the generated `googlesql.go` bridge is ~7 MB. Expect the Go compiler
+The first build is heavy: the embedded `googlesql.wasm` is ~13 MB and
+the generated `googlesql.go` bridge is ~10 MB. Expect the Go compiler
 to need several gigabytes of RAM and tens of seconds for a cold
 build. See [Resource footprint](#resource-footprint) for measured
 numbers and runtime cost.
@@ -186,8 +186,8 @@ before running the test suite.
 ## Resource footprint
 
 GoogleSQL is a large engine, and its compiled form is correspondingly
-large: the embedded WebAssembly module is ~12 MB and the Go bridge is
-~7 MB. Build cost and runtime cost are higher than for a typical Go
+large: the embedded WebAssembly module is ~13 MB and the Go bridge is
+~10 MB. Build cost and runtime cost are higher than for a typical Go
 dependency.
 
 ### Build
@@ -196,7 +196,7 @@ dependency.
 
 | Phase            | Wall time | Peak RSS  |
 |------------------|-----------|-----------|
-| `go test -c .`   | ~22 s     | ~3.7 GB   |
+| `go test -c .`   | ~27 s     | ~4.3 GB   |
 
 ### Runtime — `googlesql.Init`
 
