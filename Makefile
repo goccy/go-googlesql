@@ -1,5 +1,5 @@
 GOOGLESQL_WASM_REPO     ?= goccy/googlesql-wasm
-GOOGLESQL_WASM_VERSION  ?= v0.1.5
+GOOGLESQL_WASM_VERSION  ?= v0.1.6
 GOOGLESQL_WASM_WORKFLOW ?= goccy/googlesql-wasm/.github/workflows/build.yml
 
 ARTIFACTS       ?= googlesql.go googlesql.wasm
