@@ -42,12 +42,10 @@ Tracks GoogleSQL revision
 [`36dd14aa0657ea299725504bc0f938732f58f380`](https://github.com/google/googlesql/commit/36dd14aa0657ea299725504bc0f938732f58f380)
 (2026-01-31). New upstream revisions are picked up here as they land.
 
-The library passes the full test suite of
-[`goccy/go-zetasqlite`](https://github.com/goccy/go-zetasqlite), which
-gives a baseline that it is usable for real workloads. It is now used
-by [`goccy/googlesqlite`](https://github.com/goccy/googlesqlite) and
+go-googlesql is used by
+[`goccy/googlesqlite`](https://github.com/goccy/googlesqlite) and
 [`goccy/bigquery-emulator`](https://github.com/goccy/bigquery-emulator),
-both of which have completed their migration onto `go-googlesql`.
+both of which have completed their migration onto it.
 
 ## Installation
 
