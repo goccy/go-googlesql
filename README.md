@@ -44,11 +44,10 @@ Tracks GoogleSQL revision
 
 The library passes the full test suite of
 [`goccy/go-zetasqlite`](https://github.com/goccy/go-zetasqlite), which
-gives a baseline that it is usable for real workloads. It has not yet
-seen broad production traffic, so treat it as **early-access**. Planned
-next steps: migrate `goccy/go-zetasqlite` and
-[`goccy/bigquery-emulator`](https://github.com/goccy/bigquery-emulator)
-onto `go-googlesql`.
+gives a baseline that it is usable for real workloads. It is now used
+by [`goccy/googlesqlite`](https://github.com/goccy/googlesqlite) and
+[`goccy/bigquery-emulator`](https://github.com/goccy/bigquery-emulator),
+both of which have completed their migration onto `go-googlesql`.
 
 ## Installation
 
