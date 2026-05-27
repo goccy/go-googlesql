@@ -163,17 +163,22 @@ make verify
 
 The Makefile target does two things:
 
-1. `verify-attestation` calls `gh release verify-asset` against the
-   `goccy/googlesql-wasm` release. That confirms the in-tree
-   `googlesql_wasm2go.sha256` manifest carries a valid GitHub release
-   attestation listing it as a release asset.
-2. `verify-release` runs `shasum -a 256 -c googlesql_wasm2go.sha256`
-   so every file extracted from `googlesql_wasm2go.tar.gz` is
-   byte-for-byte identical to the digest the release signed.
+1. `verify-release` runs `shasum -a 256 -c googlesql_wasm2go.sha256`
+   as a fast sanity check that every file extracted from
+   `googlesql_wasm2go.tar.gz` matches its manifest entry byte-for-byte.
+2. `verify-attestation` fetches the upstream SLSA build-attestation
+   bundle from the public `/repos/.../attestations/sha256:<digest>`
+   API (anonymously) and hands it to `gh attestation verify --bundle`
+   for every file listed in the manifest. The `--signer-workflow` flag
+   pins the trusted signer to
+   `goccy/googlesql-wasm/.github/workflows/build.yml`, so only files
+   produced by that workflow verify successfully.
 
 Both checks run unauthenticated — no `gh auth login`, no `GH_TOKEN` /
-`GITHUB_TOKEN`. CI runs the same target on every push to `main` and
-every pull request before running the test suite.
+`GITHUB_TOKEN` (technique from
+<https://zenn.dev/shunsuke_suzuki/articles/gh-at-verify-without-access-token>).
+CI runs the same target on every push to `main` and every pull
+request before running the test suite.
 
 ## Resource footprint
 
