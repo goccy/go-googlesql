@@ -1,96 +1,74 @@
-# Cutting the build/lint cost go-googlesql imposes on downstream consumers
+# Build/lint cost that go-googlesql imposes on downstream consumers
 
-**Scenario.** A project that depends on `go-googlesql` runs golangci-lint (or
-any build). To get `go-googlesql`'s type information, the toolchain must
-**compile** the generated wasm2go runtime (`internal/wasm2go`, ~5.3M lines) to
-export data. That compile is the slow, memory-heavy "full build" the consumer
-pays — and it is paid on the first/cold run, so caches don't save us.
+**Scenario.** A project that depends on `go-googlesql` runs golangci-lint (or any
+build). To obtain `go-googlesql`'s type information the toolchain must **compile**
+the generated wasm2go runtime (`internal/wasm2go`, ~5.3M lines, 40,546 functions)
+to export data. That compile is the slow, memory-heavy "full build" the consumer
+pays, on the first/cold run, so caches don't save us.
 
 The fix belongs in the **wasm2go** generator (it lowers the WASM from
 **googlesql-wasm** to these files). The checked-in `internal/wasm2go/*.go` are
 byte-verified release artifacts (`make verify`) and are not hand-edited. This
-records the generator changes and their measured effect. Reproduction harness +
-prototypes: `tools/buildcost/`.
+records what was measured. Reproduction harness + prototypes: `tools/buildcost/`.
 
-Method: cold GOCACHE (std pre-warmed), idle 4-CPU / 15 GB box, Go 1.25,
-`-p=4`. Peak RSS = max single process (`wait4` rusage). Each number is a
-back-to-back fresh-cache run.
+## Honest summary
 
-## The cost, and what it is NOT
+There is **no dramatic source-level lever**. Cosmetic shrinking of the generated
+Go (fewer lines/variables/statements) yields only a modest, reproducible
+compile-time win and does **not** move whole-program linters. The only lever with
+*dramatic* potential is reducing the number of translated functions, which lives
+upstream in **googlesql-wasm** (the compile cost is ~linear in function count and
+0 % of functions are dead).
 
-A downstream consumer's golangci uses **export data** for `go-googlesql` (it is
-an external module to them), so the cost is the **compile**, not a source
-type-check. Baseline cold `go build ./internal/wasm2go/...`: **116.9 s /
-1.58 GB**.
+## Measured levers
 
-Two tempting ideas that the measurements **kill**:
-
-* **Dead-code elimination — not a lever.** 0 % of the 40,546 generated functions
-  are dead: every one is referenced (11,602 are address-taken into the
-  18,188-entry indirect-call table, and all have cross-package `//go:linkname`
-  forward declarations). The WASM is fully live; there is nothing to drop.
-* **`//go:noinline` on every function — no effect.** 116.7 s / 1.58 GB, i.e.
-  identical to baseline. The compiler already isn't inlining these large,
-  indirectly-called bodies, so suppressing it changes nothing.
-* **Lower the 650k `*(*T)(unsafe.Add(m.M,a))` accesses to helper calls** — a
-  large regression (`go build` >12× slower; whole-program lint 14.5 GB) because
-  the compiler then inlines 650k tiny calls. Rejected.
-
-## What works: trim what the emitter emits
-
-Three semantics-preserving emitter changes the wasm2go translator can make while
-lowering the WASM value stack (it already computes everything needed):
-
-1. **Blank-use lines.** `_ = vN` is emitted after *every* temp to dodge
-   "declared and not used". Emit it only for the rare **write-only** temp; every
-   read temp doesn't need it.
-2. **Empty statements after labels.** `Ln:` is followed by a lone `;`
-   unconditionally; only needed when the label ends its block.
-3. **Single-use stack temps.** A value pushed and consumed by the next op gets a
-   named local; copy-propagate it into its single use and drop the local.
-
-Combined effect on the artifacts (prototypes in `tools/buildcost/`):
-lines 5.35M → 3.71M (−31 %), variable objects 837k → 562k (−33 %). Builds clean,
-full test suite passes.
-
-Cold `go build ./internal/wasm2go/...` (the downstream compile cost):
+### Deterministic per-package compile (cache-free `go tool compile`, p0 = largest package, 2 reps each, stable to ±0.01 s)
 
 | Variant | wall | peak RSS |
 |---|---|---|
-| Baseline | 116.9 s | 1.58 GB |
-| `//go:noinline` only | 116.7 s | 1.58 GB (no change) |
-| **Emitter cleanups** | **78.3 s** | **0.86 GB** |
+| baseline | 5.51 s | 702 MB |
+| emitter cleanups (B1) | 5.05 s | 653 MB | **−8 % / −7 %** |
+| `//go:noinline` only | 5.50 s | 699 MB | no change |
+| B1 + `//go:noinline` | 5.29 s | 646 MB | −4 % / −8 % |
 
-→ **−33 % wall, −46 % peak memory**, cold, no cache — directly reducing the
-first/cold build every dependent project pays.
+* **Emitter cleanups (B1)** = drop redundant `_ = vN` blank-uses (keep only
+  write-only temps), drop lone `;` after labels (keep only end-of-block),
+  copy-propagate single-use adjacent stack temps. Reduces the artifacts 5.35M →
+  3.71M lines (−31 %) and 837k → 562k variable objects (−33 %), builds clean,
+  full test suite passes — but the **compile** only drops ~8 %/7 %, because the
+  type-checker/SSA cost is dominated by the operations, which remain.
+* **`//go:noinline`** does nothing (the compiler already doesn't inline these
+  large, indirectly-called bodies) and slightly cancels B1's wall-time gain.
 
-> Note on the lint-the-runtime-directly case: these same cleanups do **not**
-> move golangci when it type-checks the runtime *as in-module source* (262 s vs
-> 276 s — its cost is in the operations, which remain). That case isn't the
-> target scenario; for downstream consumers the cost is the compile above, which
-> the cleanups do cut.
+### Whole-program full build is noise-dominated
+Cold `go build ./internal/wasm2go/...` varied 114–146 s across runs on this
+shared box; B1's ~8 % per-package gain washes out under that variance and the
+cross-package link/inline cost. So the per-package deterministic number above is
+the trustworthy figure: a real but **modest** improvement.
 
-### Reflecting it in the generator
-Apply the three rules in the emitter:
-* emit `_ = vN` only when the temp has zero read uses;
-* emit the post-label `;` only when the next emitted line closes the block;
-* fold a single-use temp whose value is consumed by the immediately following
-  statement into that use.
+### Rejected, with measurements
+* **Dead-code elimination — not a lever.** 0 % of 40,546 functions are dead:
+  11,602 are address-taken into the 18,188-entry indirect-call table and every
+  function has cross-package `//go:linkname` declarations. Nothing to drop.
+* **Lower the 650k `*(*T)(unsafe.Add(m.M,a))` accesses to helper calls** —
+  regresses badly (`go build` >12× slower; whole-program lint 14.5 GB) because
+  the compiler then inlines 650k tiny calls.
+* **Ship the runtime as a separate module** — doesn't help the cold/first run
+  (the compile still happens) and whole-program linters recompile dependency
+  source anyway.
 
-No behavior, API, or attestation/sha256 change.
-
-## Complementary lever (upstream, linear)
-Compile cost is ~linear in the number of translated functions (40,546). The WASM
-is already fully live (0 % dead), so further gains must come from **reducing the
-WASM footprint in googlesql-wasm** — building zetasql with fewer features /
-stronger size optimization (`wasm-opt -Oz`, `--gc-sections`) so fewer functions
-are emitted. This scales the whole table down and stacks with the emitter
-cleanups.
+## The only dramatic lever: shrink the WASM upstream
+Compile cost is ~linear in translated function count (40,546, all live). Reducing
+the zetasql/WASM footprint in **googlesql-wasm** — fewer compiled-in features,
+stronger size optimization (`wasm-opt -Oz`, `--gc-sections`) — removes whole
+functions and scales the entire cost down proportionally. This is the only change
+with the potential to *dramatically* cut what downstream consumers pay, and it
+lives in the repo the WASM is built from.
 
 ## Recommendation (priority order)
-1. **Ship the emitter cleanups** → −33 % time / −46 % memory on the cold
-   dependency build that downstream linters pay. Highest leverage available
-   purely within the generator.
-2. **Reduce the WASM footprint upstream** for linear, compounding gains.
+1. **Reduce the WASM footprint in googlesql-wasm** — the only lever with
+   dramatic, linear payoff on the cold compile downstream consumers pay.
+2. **Ship the emitter cleanups (B1)** in the generator — a modest but free
+   ~8 %/7 % compile win and 31 % smaller artifacts; no behavior/API change.
 3. Do **not** add `//go:noinline` (no effect) or lower memory access to helper
-   calls (regresses).
+   calls (large regression).
