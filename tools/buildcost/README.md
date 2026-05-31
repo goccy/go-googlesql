@@ -29,14 +29,14 @@ go run runmax.go "$GOROOT/pkg/tool/linux_amd64/compile" \
   -importcfg /tmp/p0.importcfg -o /tmp/o.a -pack internal/wasm2go/p0/p0.go
 ```
 
-Measured p0 (cache-free, 2 reps, ±0.01 s):
+Measured p0 (cache-free, 4 reps back-to-back; wall spread ±3 % = noise):
 
 | Variant | wall | peak RSS |
 |---|---|---|
-| baseline | 5.51 s | 702 MB |
-| emitter cleanups (`emitter_cleanups.go` + `inline_singleuse.go`) | 5.05 s | 653 MB (−8 % / −7 %) |
-| `//go:noinline` only | 5.50 s | 699 MB (no change) |
-| both | 5.29 s | 646 MB |
+| baseline | ~7.0 s | ~707 MB |
+| emitter cleanups (`emitter_cleanups.go` + `inline_singleuse.go`) | ~7.2 s | ~644 MB (RSS −9 %, wall flat) |
+| `//go:noinline` only | ~7.0 s | ~698 MB (no change) |
+| both | ~6.95 s | ~644 MB |
 
 Apply transforms to a copy; the in-tree `internal/wasm2go/*.go` are
 sha256/attestation-verified and must not change.

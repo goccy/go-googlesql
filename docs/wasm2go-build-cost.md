@@ -22,29 +22,33 @@ upstream in **googlesql-wasm** (the compile cost is ~linear in function count an
 
 ## Measured levers
 
-### Deterministic per-package compile (cache-free `go tool compile`, p0 = largest package, 2 reps each, stable to ±0.01 s)
+### Deterministic per-package compile (cache-free `go tool compile`, p0 = largest package, 4 reps each, back-to-back)
 
 | Variant | wall | peak RSS |
 |---|---|---|
-| baseline | 5.51 s | 702 MB |
-| emitter cleanups (B1) | 5.05 s | 653 MB | **−8 % / −7 %** |
-| `//go:noinline` only | 5.50 s | 699 MB | no change |
-| B1 + `//go:noinline` | 5.29 s | 646 MB | −4 % / −8 % |
+| baseline | ~7.0 s | ~707 MB |
+| emitter cleanups (B1) | ~7.2 s | ~644 MB | **RSS −9 %, wall flat** |
+| `//go:noinline` only | ~7.0 s | ~698 MB | no change |
+| B1 + `//go:noinline` | ~6.95 s | ~644 MB | RSS −9 %, wall flat |
+
+(Per-rep wall spread is ±3 %, so the wall differences are within noise; only the
+~9 % peak-memory reduction from B1 is consistent across all reps.)
 
 * **Emitter cleanups (B1)** = drop redundant `_ = vN` blank-uses (keep only
   write-only temps), drop lone `;` after labels (keep only end-of-block),
   copy-propagate single-use adjacent stack temps. Reduces the artifacts 5.35M →
   3.71M lines (−31 %) and 837k → 562k variable objects (−33 %), builds clean,
-  full test suite passes — but the **compile** only drops ~8 %/7 %, because the
-  type-checker/SSA cost is dominated by the operations, which remain.
+  full test suite passes — but the **compile** only drops ~9 % in peak memory and
+  nothing measurable in wall time, because the type-checker/SSA cost is dominated
+  by the operations, which remain.
 * **`//go:noinline`** does nothing (the compiler already doesn't inline these
-  large, indirectly-called bodies) and slightly cancels B1's wall-time gain.
+  large, indirectly-called bodies).
 
 ### Whole-program full build is noise-dominated
 Cold `go build ./internal/wasm2go/...` varied 114–146 s across runs on this
-shared box; B1's ~8 % per-package gain washes out under that variance and the
+shared box; B1's modest per-package gain washes out under that variance and the
 cross-package link/inline cost. So the per-package deterministic number above is
-the trustworthy figure: a real but **modest** improvement.
+the trustworthy figure: a real but **modest** improvement (memory only).
 
 ### Rejected, with measurements
 * **Dead-code elimination — not a lever.** 0 % of 40,546 functions are dead:
@@ -69,6 +73,7 @@ lives in the repo the WASM is built from.
 1. **Reduce the WASM footprint in googlesql-wasm** — the only lever with
    dramatic, linear payoff on the cold compile downstream consumers pay.
 2. **Ship the emitter cleanups (B1)** in the generator — a modest but free
-   ~8 %/7 % compile win and 31 % smaller artifacts; no behavior/API change.
+   ~9 % compile peak-memory reduction and 31 % smaller artifacts (no wall-time
+   change); no behavior/API change.
 3. Do **not** add `//go:noinline` (no effect) or lower memory access to helper
    calls (large regression).
