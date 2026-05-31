@@ -1,93 +1,96 @@
-# Cutting the golangci-lint / build cost of the generated wasm2go runtime
+# Cutting the build/lint cost go-googlesql imposes on downstream consumers
 
-The generated runtime in `internal/wasm2go/{base,p0..p10,wasm2go.go}` is ~5.3M
-lines / ~100 MB. Running any type-aware golangci-lint linter forces a full
-type-check of it and is slow + memory-hungry.
+**Scenario.** A project that depends on `go-googlesql` runs golangci-lint (or
+any build). To get `go-googlesql`'s type information, the toolchain must
+**compile** the generated wasm2go runtime (`internal/wasm2go`, ~5.3M lines) to
+export data. That compile is the slow, memory-heavy "full build" the consumer
+pays — and it is paid on the first/cold run, so caches don't save us.
 
-The fix belongs in the **wasm2go** generator (it lowers the WASM in
-**googlesql-wasm** to these files). The files checked in here are byte-verified
-release artifacts (`make verify`) and are not hand-edited. This document records
-what was measured and what the generator should change.
-
-All numbers are **cold GOCACHE unless stated**, std pre-warmed, on a 4-CPU /
-15 GB box, `golangci-lint v2.5.0`, `--default=none --enable=govet ./...`.
-Peak RSS = max single process (`wait4` rusage). Reproduction harness +
+The fix belongs in the **wasm2go** generator (it lowers the WASM from
+**googlesql-wasm** to these files). The checked-in `internal/wasm2go/*.go` are
+byte-verified release artifacts (`make verify`) and are not hand-edited. This
+records the generator changes and their measured effect. Reproduction harness +
 prototypes: `tools/buildcost/`.
 
-## Where the cost is
+Method: cold GOCACHE (std pre-warmed), idle 4-CPU / 15 GB box, Go 1.25,
+`-p=4`. Peak RSS = max single process (`wait4` rusage). Each number is a
+back-to-back fresh-cache run.
 
-| Workload | wall | peak RSS |
+## The cost, and what it is NOT
+
+A downstream consumer's golangci uses **export data** for `go-googlesql` (it is
+an external module to them), so the cost is the **compile**, not a source
+type-check. Baseline cold `go build ./internal/wasm2go/...`: **116.9 s /
+1.58 GB**.
+
+Two tempting ideas that the measurements **kill**:
+
+* **Dead-code elimination — not a lever.** 0 % of the 40,546 generated functions
+  are dead: every one is referenced (11,602 are address-taken into the
+  18,188-entry indirect-call table, and all have cross-package `//go:linkname`
+  forward declarations). The WASM is fully live; there is nothing to drop.
+* **`//go:noinline` on every function — no effect.** 116.7 s / 1.58 GB, i.e.
+  identical to baseline. The compiler already isn't inlining these large,
+  indirectly-called bodies, so suppressing it changes nothing.
+* **Lower the 650k `*(*T)(unsafe.Add(m.M,a))` accesses to helper calls** — a
+  large regression (`go build` >12× slower; whole-program lint 14.5 GB) because
+  the compiler then inlines 650k tiny calls. Rejected.
+
+## What works: trim what the emitter emits
+
+Three semantics-preserving emitter changes the wasm2go translator can make while
+lowering the WASM value stack (it already computes everything needed):
+
+1. **Blank-use lines.** `_ = vN` is emitted after *every* temp to dodge
+   "declared and not used". Emit it only for the rare **write-only** temp; every
+   read temp doesn't need it.
+2. **Empty statements after labels.** `Ln:` is followed by a lone `;`
+   unconditionally; only needed when the label ends its block.
+3. **Single-use stack temps.** A value pushed and consumed by the next op gets a
+   named local; copy-propagate it into its single use and drop the local.
+
+Combined effect on the artifacts (prototypes in `tools/buildcost/`):
+lines 5.35M → 3.71M (−31 %), variable objects 837k → 562k (−33 %). Builds clean,
+full test suite passes.
+
+Cold `go build ./internal/wasm2go/...` (the downstream compile cost):
+
+| Variant | wall | peak RSS |
 |---|---|---|
-| golangci-lint govet `./...` (in-module, cold) | 276 s | 5.6 GB |
-| golangci-lint govet `.` root pkg only (in-module, cold) | 240 s | 5.8 GB |
-| `go build ./internal/wasm2go/...` (compile incl. codegen, cold) | 114 s | 1.6 GB |
+| Baseline | 116.9 s | 1.58 GB |
+| `//go:noinline` only | 116.7 s | 1.58 GB (no change) |
+| **Emitter cleanups** | **78.3 s** | **0.86 GB** |
 
-* golangci-lint **type-checks the whole in-module source graph** — linting only
-  the root package costs the same, so narrowing the lint scope does nothing.
-* The cost is `go/types` over the source, not codegen.
+→ **−33 % wall, −46 % peak memory**, cold, no cache — directly reducing the
+first/cold build every dependent project pays.
 
-## What does NOT work (measured, so we don't repeat it)
+> Note on the lint-the-runtime-directly case: these same cleanups do **not**
+> move golangci when it type-checks the runtime *as in-module source* (262 s vs
+> 276 s — its cost is in the operations, which remain). That case isn't the
+> target scenario; for downstream consumers the cost is the compile above, which
+> the cleanups do cut.
 
-| Approach | result vs baseline 276 s / 5.6 GB |
-|---|---|
-| **Emitter cleanups** — `_ = vN` only for write-only temps; drop `;` after labels except end-of-block; copy-propagate single-use stack temps. −31% lines (5.35M→3.71M), −33% variable objects (837k→562k), builds + tests pass. | **262 s / 5.9 GB — within noise.** Helps `go build` ~8%/7%, but `go/types`' cost is in the *operations*, which remain. |
-| **Memory-helper calls** — lower `*(*int32)(unsafe.Add(m.M, a))` (650,194 sites) to `m.LI32(a)` / `m.SI32(a,v)`. | **265 s / 14.5 GB ✗** and `go build` >12× slower — the compiler inlines 650k tiny calls. Rejected. |
-| **Narrow lint scope** to root package only. | 240 s / 5.8 GB — no real change (deps still type-checked from source). |
+### Reflecting it in the generator
+Apply the three rules in the emitter:
+* emit `_ = vN` only when the temp has zero read uses;
+* emit the post-label `;` only when the next emitted line closes the block;
+* fold a single-use temp whose value is consumed by the immediately following
+  statement into that use.
 
-Source-level shrinking of the generated code does **not** move golangci-lint,
-and the obvious "fewer expressions" idea backfires.
+No behavior, API, or attestation/sha256 change.
 
-## What works: ship the runtime as its own module
-
-golangci-lint re-type-checks **in-module** source on every run, but consumes an
-**external module dependency** through its compiled **export data** — it never
-type-checks that dependency's source. So move the runtime out of the main module.
-
-Measured with the runtime relocated to a separate module
-`github.com/goccy/go-googlesql/internal/wasm2go` (served via a file proxy so it
-lands in the module cache as a normal dependency), main module unchanged:
-
-| Configuration (warm build cache — normal dev) | wall | peak RSS |
-|---|---|---|
-| Runtime **in-module** (current) | 120 s | 5.5 GB |
-| Runtime **external module** (export data) | **55 s** | **3.0 GB** |
-
-→ **2.2× faster, 1.8× less memory**, every lint. The expensive compile of the
-runtime happens **once per version** (cacheable, 114 s / 1.6 GB via parallel
-`go build`) instead of an in-process 5.5 GB type-check on every lint. Cold, the
-two are comparable (236 s vs 276 s); the win is the steady state, because the
-runtime's export data is a legitimate immutable artifact (this is exactly why
-linting a normal project doesn't re-type-check stdlib / large deps from source).
-
-The remaining 3.0 GB is type-checking the in-module public binding
-(`googlesql.go`, ~340k lines); externalizing the runtime removes the 5.3M-line
-part entirely.
-
-### How to reflect it in the generator
-The wasm2go generator already emits a self-contained package tree
-(`base`, `p0..p10`, `wasm2go.go`). Have it additionally emit a `go.mod` and
-publish that tree as a **versioned module** (e.g. from the googlesql-wasm
-release, or a dedicated `go-googlesql-runtime` module). `go-googlesql` then
-`require`s it instead of vendoring the source in-tree. No change to the
-generated Go itself; the attestation/sha256 flow is unaffected.
-
-> A local `replace => ./dir` does **not** achieve this — go/packages treats a
-> replaced directory as editable workspace source and golangci-lint type-checks
-> it. It must be a real cached module (require + proxy/VCS, no path replace).
-
-## Complementary, independent levers
-* **Shrink the WASM upstream (googlesql-wasm).** golangci cost is ~linear in the
-  number of translated functions (32,558 today). Building zetasql-wasm with dead
-  -code elimination (`--gc-sections`, `wasm-opt -Oz`, only required features)
-  removes whole functions → proportionally less Go to type-check. Root-cause and
-  linear; stacks with the module split.
-* **Emitter cleanups** (the −31%/−33% above): worth shipping for smaller
-  artifacts and faster `go build`/CI even though they don't move golangci.
+## Complementary lever (upstream, linear)
+Compile cost is ~linear in the number of translated functions (40,546). The WASM
+is already fully live (0 % dead), so further gains must come from **reducing the
+WASM footprint in googlesql-wasm** — building zetasql with fewer features /
+stronger size optimization (`wasm-opt -Oz`, `--gc-sections`) so fewer functions
+are emitted. This scales the whole table down and stacks with the emitter
+cleanups.
 
 ## Recommendation (priority order)
-1. **Publish the wasm2go runtime as a separate versioned module** → 2.2× faster,
-   1.8× less golangci memory in steady state; compile once per version.
-2. **Reduce the WASM binary's function count** in googlesql-wasm (dead-code
-   elimination) → linear reduction that compounds with (1).
-3. Land the **emitter cleanups** as a free size/compile win.
-4. Do **not** lower memory access to helper calls (B2) — it regresses badly.
+1. **Ship the emitter cleanups** → −33 % time / −46 % memory on the cold
+   dependency build that downstream linters pay. Highest leverage available
+   purely within the generator.
+2. **Reduce the WASM footprint upstream** for linear, compounding gains.
+3. Do **not** add `//go:noinline` (no effect) or lower memory access to helper
+   calls (regresses).
