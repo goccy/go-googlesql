@@ -13,6 +13,7 @@ fix lives in the upstream **wasm2go** generator (and **googlesql-wasm**).
 | `inline_singleuse.go` | Copy-propagate single-use, adjacent stack temps (no-chain-safe). Run to a fixpoint by re-feeding output. |
 | `noinline_emit.go` | **Rejected (no effect):** prepend `//go:noinline` to every translated `func FnN`. |
 | `memhelper_rejected.go` | **Rejected (regresses):** lower `*(*T)(unsafe.Add(m.M,a))` to `m.L*/m.S*` calls — `go build` >12× slower, 14.5 GB lint. |
+| `wasm_inspect.go` | Dump a WASM module's section map + defined-function/export counts. `go run wasm_inspect.go googlesql.wasm`. See `docs/wasm-size-experiment.md`. |
 
 ## Trustworthy measurement: deterministic per-package compile
 
