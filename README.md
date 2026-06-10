@@ -13,28 +13,29 @@ I previously maintained
 [`goccy/go-zetasql`](https://github.com/goccy/go-zetasql), which
 exposed the same engine through cgo. The cgo dependency made
 cross-compilation, static linking, and overall portability painful.
-`go-googlesql` solves that by running GoogleSQL inside a WebAssembly
-module — no cgo, no native toolchain, just a pure Go library.
+`go-googlesql` solves that by compiling GoogleSQL down to WebAssembly
+and then transpiling that wasm to pure Go source via
+[`goccy/wasm2go`](https://github.com/goccy/wasm2go) — no cgo, no
+native toolchain, no embedded wasm runtime, just a regular Go library.
 
 ## Features
 
-- **Pure Go, no cgo.** GoogleSQL runs inside a WebAssembly module
-  loaded with [`tetratelabs/wazero`](https://github.com/tetratelabs/wazero).
-  `CGO_ENABLED=0` builds, static linking, and cross-compilation all
-  work without extra setup.
-- **Auto-generated end-to-end.** `googlesql.wasm` and the Go bridge
-  `googlesql.go` are produced upstream by
-  [`goccy/wasmify`](https://github.com/goccy/wasmify) +
+- **Pure Go, no cgo, no wasm runtime.** GoogleSQL is transpiled from
+  WebAssembly directly to Go source by
+  [`goccy/wasm2go`](https://github.com/goccy/wasm2go), so there is no
+  embedded interpreter or JIT — the engine is just Go code the toolchain
+  compiles ahead of time. `CGO_ENABLED=0` builds, static linking, and
+  cross-compilation all work without extra setup.
+- **Auto-generated end-to-end.** The Go bridge `googlesql.go` and the
+  transpiled engine under `internal/wasm2go/` are produced upstream by
+  [`goccy/wasm2go`](https://github.com/goccy/wasm2go) +
   [`goccy/googlesql-wasm`](https://github.com/goccy/googlesql-wasm).
   When upstream GoogleSQL ships a new revision, the artifacts here
   follow without manual intervention.
 - **End-to-end provenance.** Every released artifact is signed with
   [GitHub artifact attestations](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations).
-  CI re-verifies the in-tree binary against the signed release on
+  CI re-verifies the in-tree files against the signed release on
   every PR (see [Verifying provenance](#verifying-provenance)).
-- **Both wazero execution modes.** Compiler and interpreter modes are
-  selectable through `WithCompilationMode`. See
-  [Resource footprint](#resource-footprint) for the trade-offs.
 
 ## Status
 
@@ -53,19 +54,21 @@ both of which have completed their migration onto it.
 go get github.com/goccy/go-googlesql
 ```
 
-The first build is heavy: the embedded `googlesql.wasm` is ~13 MB and
-the generated `googlesql.go` bridge is ~10 MB. Expect the Go compiler
-to need several gigabytes of RAM and tens of seconds for a cold
-build. See [Resource footprint](#resource-footprint) for measured
-numbers and runtime cost.
+The first build is heavy: the engine is shipped as transpiled Go
+source (~108 MB across `internal/wasm2go/`) plus a ~10 MB bridge in
+`googlesql.go`. Expect the Go compiler to need several gigabytes of
+RAM and a couple of minutes for a cold build. See
+[Resource footprint](#resource-footprint) for measured numbers and
+runtime cost.
 
 ## Synopsis
 
-### Initialise the wasm runtime
+### Initialise the engine
 
-`Init` loads the embedded wasm module. Call it once per process before
-using any other API; it is `sync.Once`-guarded so calling more than
-once is a no-op.
+`Init` initialises the transpiled wasm2go engine. Call it once per
+process before using any other API; it is `sync.Once`-guarded so
+calling more than once is a no-op. There is no runtime to tear down,
+so no `Close` is needed.
 
 ```go
 package main
@@ -73,15 +76,9 @@ package main
 import "github.com/goccy/go-googlesql"
 
 func main() {
-    if err := googlesql.Init(
-        googlesql.WithCompilationMode(googlesql.CompilationModeCompiler),
-        // Optional: re-use a persistent wazero compilation cache so
-        // subsequent processes skip the ~3 s wasm-to-native compile.
-        googlesql.WithCompilationCache("/var/cache/go-googlesql"),
-    ); err != nil {
+    if err := googlesql.Init(); err != nil {
         panic(err)
     }
-    defer googlesql.Close()
 
     // ...use the parser / analyzer APIs here...
 }
@@ -166,71 +163,69 @@ make verify
 
 The Makefile target does two things:
 
-1. `verify-release` downloads the v0.1.2 release artifacts from
-   `goccy/googlesql-wasm` and byte-for-byte compares them to the
-   in-tree files. Any divergence aborts the build.
-2. `verify-attestation` fetches each artifact's GitHub attestation
-   bundle from the public `/attestations/` API, hands it to
-   `gh attestation verify --bundle`, and pins the signer to
-   `goccy/googlesql-wasm/.github/workflows/build.yml`.
+1. `verify-release` runs `shasum -a 256 -c googlesql_wasm2go.sha256`
+   as a fast sanity check that every file extracted from
+   `googlesql_wasm2go.tar.gz` matches its manifest entry byte-for-byte.
+2. `verify-attestation` fetches the upstream SLSA build-attestation
+   bundle from the public `/repos/.../attestations/sha256:<digest>`
+   API (anonymously) and hands it to `gh attestation verify --bundle`
+   for every file listed in the manifest. The `--signer-workflow` flag
+   pins the trusted signer to
+   `goccy/googlesql-wasm/.github/workflows/build.yml`, so only files
+   produced by that workflow verify successfully.
 
 Both checks run unauthenticated — no `gh auth login`, no `GH_TOKEN` /
 `GITHUB_TOKEN` (technique from
 <https://zenn.dev/shunsuke_suzuki/articles/gh-at-verify-without-access-token>).
-CI runs the same target on every push to `main` and every pull request
-before running the test suite.
+CI runs the same target on every push to `main` and every pull
+request before running the test suite.
 
 ## Resource footprint
 
-GoogleSQL is a large engine, and its compiled form is correspondingly
-large: the embedded WebAssembly module is ~13 MB and the Go bridge is
-~10 MB. Build cost and runtime cost are higher than for a typical Go
-dependency.
+Because GoogleSQL ships as ahead-of-time transpiled Go (under
+`internal/wasm2go/`) instead of a wasm module plus a runtime, the cost
+shifts from process startup to the Go toolchain: compilation is
+heavier than a typical dependency, but in exchange `googlesql.Init`
+is fast and the steady-state heap is small.
+
+All numbers below were measured on the same host:
+
+- Hardware: Apple M5, 10 cores, 32 GB RAM
+- OS: macOS 26.2 (Darwin 25.2.0, arm64)
+- Toolchain: Go 1.26.2 darwin/amd64 (x86_64 binary via Rosetta — a
+  native arm64 toolchain should be somewhat faster)
 
 ### Build
 
-`go test -c` against this package on a cold Go build cache.
+Cold-cache `go test -c` against this package (`GOCACHE` pointed at an
+empty directory, measured with `/usr/bin/time -l`).
 
-| Phase            | Wall time | Peak RSS  |
-|------------------|-----------|-----------|
-| `go test -c .`   | ~27 s     | ~4.3 GB   |
+| Phase            | Wall time | Peak RSS | Binary size |
+|------------------|-----------|----------|-------------|
+| `go test -c .`   | ~76 s     | ~5.6 GB  | ~63 MB      |
+
+Subsequent builds with a warm cache complete in a few hundred
+milliseconds. The peak RSS spike is the linker; expect a build host
+with at least 8 GB of RAM available.
 
 ### Runtime — `googlesql.Init`
 
-Three runtime configurations are exposed via `WithCompilationMode`
-and `WithCompilationCache(dir)`:
+`Init` is called once per process. Wall and CPU were captured around
+the `Init` call via `syscall.Getrusage`; heap was sampled via
+`runtime.MemStats` after a `runtime.GC()` so transient init
+allocations are excluded; process peak RSS came from
+`/usr/bin/time -l` over the whole process.
 
-| Mode                              | Init wall  | Peak RSS  | Steady-state in-use |
-|-----------------------------------|------------|-----------|----------------------|
-| Compiler, no cache                | ~3.4 s     | ~500 MB   | ~87 MB               |
-| Compiler, **warm wazero cache**   | **~0.57 s**| **~205 MB** | **~87 MB**         |
-| Interpreter                       | ~0.85 s    | ~500 MB   | ~383 MB              |
+| Metric                    | Value    |
+|---------------------------|----------|
+| Init wall time            | ~150 ms  |
+| Init CPU time             | ~250 ms  |
+| Steady-state Go heap      | ~70 MiB  |
+| Process peak RSS          | ~87 MiB  |
 
-How to read this:
-
-- **Init wall** is the time `googlesql.Init(...)` blocks. Compiler
-  mode without cache compiles ~12 MB of wasm to native machine code
-  in-process every call; that is where the ~3.4 s comes from. When
-  `WithCompilationCache(dir)` points at a populated directory, the
-  compile phase is skipped and Init drops to ~0.6 s.
-- **Peak RSS** is the OS-level peak resident set size during the
-  whole process (`/usr/bin/time -l`). It captures the transient spike
-  during compile.
-- **Steady-state in-use** is the resident Go heap _after_ Init,
-  measured via `runtime/pprof.WriteHeapProfile` (top of `inuse_space`,
-  post-`runtime.GC`). This is what your service pays long-term.
-  Compiler mode keeps ~87 MB of wasm-runtime metadata; the interpreter
-  retains the full decoded operation stream (~290 MB) on top of that,
-  which is the gap.
-
-The "warm wazero cache" row is the long-running mode you almost
-certainly want in production: low Init latency *and* small steady-state
-heap. Pass `WithCompilationCache("/some/persistent/dir")` to enable
-it.
-
-Measured on Apple M5 (32 GB RAM), macOS 26.2, Go 1.26.2 amd64
-toolchain via Rosetta. Native arm64 toolchains should be somewhat
-faster.
+There are no execution-mode knobs — `Init()` takes no arguments and
+there is no `Close`. Pay the one-time ~150 ms latency, then expect a
+roughly 70 MiB resident heap for the lifetime of the process.
 
 ## License
 

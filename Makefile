@@ -1,60 +1,47 @@
 GOOGLESQL_WASM_REPO     ?= goccy/googlesql-wasm
-GOOGLESQL_WASM_VERSION  ?= v0.1.6
+GOOGLESQL_WASM_VERSION  ?= v0.3.1
 GOOGLESQL_WASM_WORKFLOW ?= goccy/googlesql-wasm/.github/workflows/build.yml
 
-ARTIFACTS       ?= googlesql.go googlesql.wasm
-RELEASE_URL      = https://github.com/$(GOOGLESQL_WASM_REPO)/releases/download/$(GOOGLESQL_WASM_VERSION)
-ATTESTATION_API  = https://api.github.com/repos/$(GOOGLESQL_WASM_REPO)/attestations
+BRIDGE_ASSET     := googlesql_wasm2go.go
+BRIDGE_FILE      := googlesql.go
+RELEASE_URL       = https://github.com/$(GOOGLESQL_WASM_REPO)/releases/download/$(GOOGLESQL_WASM_VERSION)
+ATTESTATION_API   = https://api.github.com/repos/$(GOOGLESQL_WASM_REPO)/attestations
 
-.PHONY: googlesql download verify verify-release verify-attestation test clean-bundles
+.PHONY: googlesql download verify test
 
-## googlesql: download release artifacts and verify their attestations.
+## googlesql: refresh the wasm2go bridge from the upstream release
+## and verify its GitHub artifact attestation. Default to running
+## this whenever GOOGLESQL_WASM_VERSION bumps.
 googlesql: download verify
 
-## download: fetch googlesql.{go,wasm} from the goccy/googlesql-wasm release.
+## download: fetch the wasm2go-runtime bridge from the upstream
+## release and drop it in place at $(BRIDGE_FILE). The release
+## publishes it as $(BRIDGE_ASSET); the rename is purely cosmetic
+## (gh attestation verify matches by content digest).
 download:
-	curl -fSL --proto '=https' --tlsv1.2 -o googlesql.go   $(RELEASE_URL)/googlesql.go
-	curl -fSL --proto '=https' --tlsv1.2 -o googlesql.wasm $(RELEASE_URL)/googlesql.wasm
+	curl -fSL --proto '=https' --tlsv1.2 -o $(BRIDGE_FILE) $(RELEASE_URL)/$(BRIDGE_ASSET)
 
-## verify: ensure the in-tree googlesql.{go,wasm} match the upstream release
-## bytewise AND carry valid GitHub attestations. Either check failing aborts.
-verify: verify-release verify-attestation
-
-## verify-release: byte-for-byte compare the in-tree files against the release.
-verify-release:
+## verify: confirm $(BRIDGE_FILE) carries a valid GitHub artifact
+## attestation signed by the upstream build.yml workflow. The
+## attestation bundle is fetched anonymously from the public
+## attestation API and verified offline via
+## `gh attestation verify --bundle`. No GH access token is required.
+verify:
 	@set -eu; \
-	tmp=$$(mktemp -d); \
-	trap "rm -rf $$tmp" EXIT; \
-	for f in $(ARTIFACTS); do \
-	  curl -fsSL --proto '=https' --tlsv1.2 -o $$tmp/$$f $(RELEASE_URL)/$$f; \
-	  if ! cmp -s $$f $$tmp/$$f; then \
-	    echo "ERROR: in-tree $$f differs from $(GOOGLESQL_WASM_VERSION) release"; \
-	    echo "  in-tree: $$(shasum -a 256 $$f | awk '{print $$1}')"; \
-	    echo "  release: $$(shasum -a 256 $$tmp/$$f | awk '{print $$1}')"; \
-	    exit 1; \
-	  fi; \
-	  echo "    OK $$f matches $(GOOGLESQL_WASM_VERSION) release"; \
-	done
-
-## verify-attestation: verify GitHub artifact attestations (no GH access token required).
-verify-attestation:
-	@set -eu; for f in $(ARTIFACTS); do \
-	  digest=$$(shasum -a 256 $$f | awk '{print $$1}'); \
-	  echo "==> attesting $$f (sha256:$$digest)"; \
-	  curl -fsSL --proto '=https' --tlsv1.2 \
-	    "$(ATTESTATION_API)/sha256:$$digest" \
-	    | jq '.attestations[].bundle' > $$f.bundle.jsonl; \
-	  GH_TOKEN= GITHUB_TOKEN= gh attestation verify $$f \
-	    -R $(GOOGLESQL_WASM_REPO) \
-	    --bundle $$f.bundle.jsonl \
-	    --signer-workflow $(GOOGLESQL_WASM_WORKFLOW); \
-	  echo "    OK $$f"; \
-	  rm -f $$f.bundle.jsonl; \
-	done
+	tmpdir=$$(mktemp -d); \
+	bundle=$$tmpdir/bundle.jsonl; \
+	trap 'rm -rf $$tmpdir' EXIT; \
+	digest=$$(shasum -a 256 $(BRIDGE_FILE) | awk '{print $$1}'); \
+	echo "==> fetching attestation bundle for $(BRIDGE_FILE) (sha256:$$digest)"; \
+	curl -fsSL --proto '=https' --tlsv1.2 \
+	  "$(ATTESTATION_API)/sha256:$$digest" \
+	  | jq -c '.attestations[].bundle' > $$bundle; \
+	echo "==> verifying $(BRIDGE_FILE)"; \
+	GH_TOKEN= GITHUB_TOKEN= gh attestation verify "$(BRIDGE_FILE)" \
+	  -R $(GOOGLESQL_WASM_REPO) \
+	  --bundle $$bundle \
+	  --signer-workflow $(GOOGLESQL_WASM_WORKFLOW)
 
 ## test: run the Go test suite.
 test:
 	go test ./...
-
-clean-bundles:
-	rm -f googlesql.go.bundle.jsonl googlesql.wasm.bundle.jsonl

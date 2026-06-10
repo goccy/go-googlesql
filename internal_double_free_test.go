@@ -24,7 +24,7 @@ var initOnceForTests sync.Once
 func ensureInit(t *testing.T) {
 	t.Helper()
 	initOnceForTests.Do(func() {
-		if err := Init(WithCompilationMode(CompilationModeCompiler)); err != nil {
+		if err := Init(); err != nil {
 			t.Fatalf("googlesql.Init: %v", err)
 		}
 	})

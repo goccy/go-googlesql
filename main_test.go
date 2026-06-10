@@ -9,20 +9,16 @@ import (
 	"github.com/goccy/go-googlesql"
 )
 
-// TestMain initialises the wasm runtime once and tears it down after
-// every test. The wasm binary is embedded into the googlesql package
-// via //go:embed googlesql.wasm, so Init takes no arguments. The
-// wazero compiler backend cuts per-test analysis down from minutes
-// (interpreter) to milliseconds for googlesql's register-all-builtins
-// code path.
+// TestMain initialises the wasm2go runtime once before any test runs.
+// The generated bindings ship as a dual-arch (amd64.s / arm64.s +
+// pure-Go fallback) module pulled in via go.mod, so Init takes no
+// arguments and there is no Close to call.
 func TestMain(m *testing.M) {
-	if err := googlesql.Init(googlesql.WithCompilationMode(googlesql.CompilationModeCompiler)); err != nil {
+	if err := googlesql.Init(); err != nil {
 		fmt.Fprintf(os.Stderr, "wasm init failed: %v\n", err)
 		os.Exit(1)
 	}
-	code := m.Run()
-	googlesql.Close()
-	os.Exit(code)
+	os.Exit(m.Run())
 }
 
 // gc forces garbage collection so wasm-side handles released via
