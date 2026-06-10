@@ -10,11 +10,11 @@ permissions:
 
 jobs:
   verify:
-    name: Verify googlesql attestations
+    name: Verify googlesql.go attestation
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Verify googlesql.{go,wasm} (release diff + attestation)
+      - name: Verify bridge file (release attestation)
         run: make verify
 
   test:
